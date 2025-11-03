@@ -1,3 +1,1 @@
-__version__ = "1.0.0"
-
-__all__ = ['suchen']
+__all__ = ['suchen', 'klasse', 'prep']

@@ -1,313 +1,289 @@
-import warnings
-from contextlib import contextmanager
-import functools
-import sys
-
 import numpy as np
-from sklearn.base import clone
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import r2_score, accuracy_score
+import pandas as pd
 
-from hyperopt import hp, fmin, tpe, Trials, space_eval
-from hyperopt.pyll import scope
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import roc_auc_score
+
+from category_encoders import OneHotEncoder
+
+import catboost as cb
+import xgboost as xgb
+import lightgbm as lgbm
 
 import optuna
-from optuna.samplers import TPESampler
-from optuna.pruners import MedianPruner
-from optuna.distributions import IntDistribution, FloatDistribution, CategoricalDistribution, LogUniformDistribution
+from optuna.distributions import IntDistribution, FloatDistribution, CategoricalDistribution
+from optuna.samplers import TPESampler, GridSampler
+from optuna.pruners import HyperbandPruner, MedianPruner
 
-
+import functools
+import time
 from tqdm import tqdm
+import sys
+import warnings; warnings.filterwarnings('ignore')
 
-# ----------------------------------------------------------------------------------------------------------------------------------------------------
-
-class IntDistrib:
-    def __init__(self, low, high, q=1):
-        self.low = low
-        self.high = high
-        self.q = q
-        
-class FloatDistrib:
-    def __init__(self, low, high, step=0.5):
-        self.low = low
-        self.high = high
-        self.step = step
-        
-class LogDistrib:
-    def __init__(self, low, high):
-        self.low = low
-        self.high = high
-
-class CatDistrib:
-    def __init__(self, choices):
-        self.choices = choices
-
-# ----------------------------------------------------------------------------------------------------------------------------------------------------
-
-def sample_params(optimizer, param_spaces):
-    new_param_spaces = {}   
-    for estimator_name, params in param_spaces.items():
-        new_param_spaces[estimator_name] = {}
-        for param_name, param_range in params.items():
-            
-            if optimizer == 'optuna':
-                if isinstance(param_range, IntDistrib):
-                    new_param_spaces[estimator_name][param_name] = IntDistribution(param_range.low, param_range.high)
-                elif isinstance(param_range, FloatDistrib):
-                    new_param_spaces[estimator_name][param_name] = FloatDistribution(param_range.low, param_range.high, step=param_range.step)
-                elif isinstance(param_range, LogDistrib):
-                    new_param_spaces[estimator_name][param_name] = FloatDistribution(param_range.low, param_range.high, log=True)
-                elif isinstance(param_range, CatDistrib):
-                    new_param_spaces[estimator_name][param_name] = CategoricalDistribution(param_range.choices) 
-                else:
-                    raise TypeError("Distribution should be in ['IntDistrib', 'FloatDistib', 'LogDistrib', 'CatDistrib']")
-                    
-            elif optimizer == 'hyperopt':
-                if isinstance(param_range, IntDistrib):
-                    new_param_spaces[estimator_name][param_name] = scope.int(hp.quniform(param_name, param_range.low, param_range.high, q=param_range.q))
-                elif isinstance(param_range, FloatDistrib):    
-                    new_param_spaces[estimator_name][param_name] = hp.uniform(param_name, param_range.low, param_range.high)
-                elif isinstance(param_range, LogDistrib):
-                    new_param_spaces[estimator_name][param_name] = hp.loguniform(param_name, np.log(param_range.low), np.log(param_range.high))
-                elif isinstance(param_range, CatDistrib):
-                    new_param_spaces[estimator_name][param_name] = hp.choice(param_name, param_range.choices)
-                else:
-                    raise TypeError("Distribution should be in ['IntDistrib', 'FloatDistib', 'LogDistrib', 'CatDistrib']")
-            else:
-                raise ValueError("optimizer should be in ['optuna', 'hyperopt']")
-                
-    return new_param_spaces
-
-
-# ----------------------------------------------------------------------------------------------------------------------------------------------------
-
-class Searcher:
+class Searcher():
     """
     Parameters
     ----------
-    models: dict
-        dictionary {'name': estimator }
-    
-    param_spaces: dict
-        dictionary {'estimator_name': {'param_name': param_range, }}
+    param_space : dict
+        keys: model class(not object) | values: params for searching
+        example: {xgb.XGBRegressor: {'eta': FloatDistribution(0.001, 0.1, log=True)},
+                  cb.CatBoostRegressor: {'depth': IntDistribution(2, 8)}}
 
-    task: str, default = 'regression'
-        'regression' or 'classification'
+    n_trials : int [default=100]
+        The number of trials for each process.
         
-    optimizer: str, default = 'optuna'
-        'optuna' or 'hyperopt'
+    sampler : optuna.sampler [default=TPESampler()]
+        n_startup_trials for default TPESampler() is 10% of n_trials
         
-    n_trials: int, default = 10
-        Количество итераций поиска гиперпараметров
-        
-    metrics: callable
-        default for task regression: r2_score
-        default for task classification: accuracy_score
-        
-    early_stopping_rounds: int, default = 100
-        Количество раундов ранней остановки
+    pruner : optuna.pruner [default=None]
+
+    cv : bool
+        True: using cross_validation
+        False: using eval_set
+
+    early_stopping_rounds: int [default=100]
     
-    timeout: int, default = 600
-        Предел времени выполнения одного trial
-        
-    random_state: int, default = 100
-        Состояние рандома, для воспроизводимости
-    ----------------------------------------------------------------------------------------
-    Attributes:
-    -----------
-    best_params_:
-        Лучшие параметры
-        
-    best_score_:
-        Лучшие результаты
-        
-    models_:
-        Модели с утсановленными лучшими параметрами
-        
-    pruner:
-        Pruner для optuna
-        
-    sampler:
-        Sampler для optuna
+    nfold: int [default=5]
+    
+    shuffle: bool [default=True]
+    
+    random_state: int
     """
-    def __init__(self, models, param_spaces, task='regression', optimizer='optuna', n_trials=10, metric=None, 
-                 early_stopping_rounds=100, timeout=600, random_state=100):
-        self.models = models
-        self.param_spaces = param_spaces
-        self.optimizer = optimizer.lower()
-        if self.optimizer not in ['optuna', 'hyperopt']:
-            raise ValueError("task should be in ['regression', 'classification'] ")
-            
+    def __init__(self, param_space, n_trials=100, sampler=None, pruner=None,
+                 cv=True, early_stopping_rounds=100, nfold=5, shuffle=True, random_state=0):
+        self.param_space = param_space
         self.n_trials = n_trials
-        self.task = task.lower()
-        if self.task not in ['regression', 'classification']:
-            raise ValueError("task should be in ['regression', 'classification'] ")
-
-        self.metric = metric
-        if self.metric is None:
-            if self.task == 'regression':
-                self.metric = r2_score
-            elif self.task == 'classification':
-                self.metric = accuracy_score
-            
+        self.cv = cv
         self.early_stopping_rounds = early_stopping_rounds
-        self.timeout = timeout
+        self.nfold = nfold
+        self.shuffle = shuffle
         self.random_state = random_state
-        
-        self.param_spaces_ = sample_params(self.optimizer, self.param_spaces)
-        if self.param_spaces.keys() != self.models.keys():
-            raise ValueError('Ключи(названия моделей) в models не соответствуют ключам(названиям моделей) в param_spaces')
-        
-    # ------------------------------------    
-    @contextmanager
-    def __ignore_user_warnings(self):
-        with warnings.catch_warnings():
-            warnings.filterwarnings("ignore", category=UserWarning)
-            yield  
-    # --------------------------------------        
-    def search(self, X_train, y_train, X_valid=None, y_valid=None, optuna_sampler=None, optuna_pruner=None):
-        
-        # Если валидационаня выборка не будет передана, она создастся
-        if (X_valid is None) or (y_valid is None):
-            X_train, X_valid, y_train, y_valid = train_test_split(X_train, y_train, train_size=0.9, random_state=self.random_state)
 
-        # Клонирование моделей чтобы не загрязнять переданные
-        self.models_ = {name: clone(model) for name, model in self.models.items()} 
-        self.best_params_ = {} # Пустой словарь для хранения лучших найденных параметров
-        self.best_score_ = {} # Пустой словарь для хранения лучших результатов
-
-        # Небольшая донастройка моделей, чтобы не мусорить выводом
-        for name, model in self.models_.items():
-            if name == 'LGBM':
-                model.set_params(verbose=-1)
-            if name == 'XGB':
-                model.set_params(verbosity=0)
-                
-        # Для оптюны
-        if self.optimizer == 'optuna':
-            if optuna_sampler is None:
-                self.sampler = TPESampler(seed=self.random_state)
-            if optuna_pruner is None:
-                self.pruner=MedianPruner(n_warmup_steps=5)
-                
-            self.__optuna_search(X_train, y_train, X_valid, y_valid, sampler=self.sampler, pruner=self.pruner)
-        # для hyperopt
-        elif self.optimizer == 'hyperopt':
-            self.__hyperopt_search(X_train, y_train, X_valid, y_valid)
+        if sampler is None:
+            self.sampler = TPESampler(n_startup_trials=int(self.n_trials*0.1),
+                                      seed=self.random_state)
         else:
-            raise ValueError('optimizer should be optuna or hyperopt')      
+            self.sampler = sampler
+            
+        self.pruner = pruner
+        # ----
+        self.__classification_loss = ['logloss']
+        self.__regression_loss = ['rmse']
         
-    # -------------------------------------------------------------
-    def __hyperopt_search(self, X_train, y_train, X_valid, y_valid):
-        for name in self.models_:
-            trials = Trials()
-            param_space = self.param_spaces_[name]    
-            def objective(params):
-                self.models_[name].set_params(**params)
-                if name in ['XGB', 'LGBM']:
-                    self.models_[name].set_params(early_stopping_rounds=self.early_stopping_rounds)
-                if name == 'XGB':
-                    self.models_[name].fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
-                elif name == 'LGBM':
-                    self.models_[name].fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
-                else:
-                    self.models_[name].fit(X_train, y_train)
-                # Костыль от бага "UserWarning: X does not have valid feature names...""
-                with self.__ignore_user_warnings():
-                    y_pred = self.models_[name].predict(X_valid)
-                    if self.metric is not None:
-                        score = -self.metric(y_valid, y_pred)
-                    else:
-                        if self.task == 'regression':
-                            score = -r2_score(y_valid, y_pred)
-                        else:
-                            score = -accuracy_score(y_valid, y_pred)
-                return score
-                
-            best = fmin(
-                fn = objective,
-                space = param_space,
-                algo = tpe.suggest,
-                max_evals = self.n_trials,
-                rstate = np.random.default_rng(self.random_state),
-                trials = trials
-            )
-            # Сохраняем и применяем лучшие параметры
-            self.best_params_[name] = space_eval(param_space, best)
-            # Кастим целые параметры
-            self.models_[name].set_params(**self.best_params_[name])
-            self.best_score_[name] = -trials.best_trial['result']['loss']
-    # -------------------------------------------------------------    
-    def __optuna_search(self, X_train, y_train, X_valid, y_valid, sampler, pruner):
-        optuna.logging.disable_default_handler()
-        i = 0 
-        for name in self.models_:
-            param_space = self.param_spaces_[name]
-            # Objective функция
-            def objective(trial):
-                params = {}
-                for param_name, param_range in param_space.items():
-                    params[param_name] = trial._suggest(param_name, param_range)
-                self.models_[name].set_params(**params)
-                # ------------- обучение моделей -------------
-                if name in ['XGB', 'LGBM']:
-                    self.models_[name].set_params(early_stopping_rounds = self.early_stopping_rounds)
-                    
-                if name == 'XGB':
-                    self.models_[name].fit(X_train, y_train, eval_set=[(X_valid, y_valid)], verbose=False)
-                elif name == 'LGBM':
-                    self.models_[name].fit(X_train, y_train, eval_set=[(X_valid, y_valid)])
-                else:
-                    self.models_[name].fit(X_train, y_train)
-                # -------------------------------------------
-                # Костыль от бага "UserWarning: X does not have valid feature names...""
-                with self.__ignore_user_warnings():
-                    y_pred = self.models_[name].predict(X_valid)
-                    if self.metric is not None:
-                        score = self.metric(y_valid, y_pred)
-                    else:
-                        if self.task == 'regression':                            
-                            score = r2_score(y_valid, y_pred)
-                        else:                
-                            score = accuracy_score(y_valid, y_pred)
-                return score
-                
-            study = optuna.create_study(sampler=self.sampler, direction='maximize', pruner=self.pruner)
-            @self.__tqdm_study(n_trials=self.n_trials)
-            def run_study(study, objective, n_trials, timeout, callbacks):
-                study.optimize(objective, n_trials=n_trials, timeout=timeout, callbacks=callbacks)
-            desc = f"[{name}] Model {i+1}/{len(self.models_)}"
-            run_study(study, objective, n_trials=self.n_trials, timeout=self.timeout, desc=desc)
-            best = study.best_trial
-            self.best_params_[name] = best.params
-            self.best_score_[name] = best.value
-            self.models_[name].set_params(**best.params)
-            if name in ['XGB', 'LGBM']:
-                    self.models_[name].set_params(early_stopping_rounds = None)
-            i+=1
+        self.__minimize_metrics = ['rmse']
+        self.__maximize_metrics = ['auc']
         
-    # ---------------------------------------------------------------------------------------------------
-    def __tqdm_study(self, n_trials):
-        """
-        Декоратор для оборачивания функции, которая вызывает study.optimize,
-        и добавления прогресс-бара tqdm.
-        """
+    def __tqdm_study(self, n_trials, model, direction):
+        model_name = model.__class__.__name__
         def decorator(func):
             @functools.wraps(func)
-            def wrapper(*args, desc=None, **kwargs):
-                # tqdm-progress bar
-                with tqdm(total=n_trials, desc=desc if desc else "Optimization",
-                          file=sys.stdout, bar_format="{l_bar}{bar}| {n_fmt}/{total_fmt} [{elapsed}]") as progress_bar:
+            def wrapper(*args, **kwargs):
+                if direction == 'minimize':
+                    best_score = float("inf")
+                else:
+                    best_score = float("-inf")
+                    
+                start_time = time.time()
+                with tqdm(total=n_trials, desc=f"[{model_name}]", file=sys.stdout,
+                          bar_format="{desc} {bar} {n_fmt}/{total_fmt} {postfix}") as pbar:
                     def tqdm_callback(study, trial):
-                        progress_bar.update(1)
-                        progress_bar.set_postfix({"best_score": study.best_value})
-                    if "callbacks" in kwargs and kwargs["callbacks"] is not None:
-                        kwargs["callbacks"].append(tqdm_callback)
-                    else:
-                        kwargs["callbacks"] = [tqdm_callback]
-                    return func(*args, **kwargs)
+                        nonlocal best_score
+
+                        if direction == 'minimize':
+                            if study.best_value < best_score:
+                                best_score = study.best_value
+                        else:
+                            if study.best_value > best_score:
+                                best_score = study.best_value
+                            
+                        elapsed = int(time.time() - start_time)
+                        h, rem = divmod(elapsed, 3600)
+                        m, s = divmod(rem, 60)
+                        time_str = f"{h:02d}:{m:02d}:{s:02d}"
+                        pbar.set_postfix_str(f"time: {time_str} | best_score: {best_score}")
+                        pbar.update(1)
+    
+                    return func(tqdm_callback=tqdm_callback, *args, **kwargs)
             return wrapper
         return decorator
-    
+    # ---------------------------------------    
+    def __catboost_cv(self, param_space, pool, early_stopping_rounds, fold_count, shuffle, random_state, direction):
+        if param_space['objective'] in self.__classification_loss:
+            stratified = True
+        else:
+            stratified = False
+            
+        cv_results = cb.cv(
+            params = param_space,
+            pool = pool,
+            early_stopping_rounds = early_stopping_rounds,
+            fold_count = fold_count,
+            shuffle = shuffle,
+            partition_random_seed = random_state,
+            stratified = stratified,
+            logging_level = 'Silent'
+        )
+        if direction == 'minimize':
+            best_score = cv_results[f"test-{param_space['eval_metric']}-mean"].min()
+            best_iter = cv_results['iterations'].max()
+        else:
+            best_score = cv_results[f"test-{param_space['eval_metric']}-mean"].max()
+            best_iter = cv_results['iterations'].min()
 
-__all__ = ['IntDistrib', 'FloatDistrib', 'LogDistrib', 'CatDistrib', 'sample_params', 'Searcher']
+        return best_score, best_iter
+    # ---------------------------------------
+    def __xgboost_cv(self, param_space, dtrain, early_stopping_rounds, nfold, shuffle, seed, direction):
+        if param_space['objective'] in self.__classification_loss:
+            stratified = True
+        else:
+            stratified = False
+            
+        # Разные варики итераций
+        if 'n_estimators' in param_space:
+            num_boost_round = param_space['n_estimators']
+        elif 'iterations' in param_space:
+            num_boost_round = param_space['iterations']
+        else:
+            num_boost_round = 1_000
+            
+        cv_results = xgb.cv(
+            params = param_space,
+            dtrain = dtrain,
+            early_stopping_rounds = early_stopping_rounds,
+            nfold = nfold,
+            shuffle = shuffle,
+            seed = seed,
+            stratified = stratified,
+            num_boost_round = num_boost_round
+        )
+        if direction == 'minimize':
+            best_score = cv_results[f"test-{param_space['eval_metric']}-mean"].min()
+            best_iter = cv_results[f"test-{param_space['eval_metric']}-mean"].idxmin() + 1
+        else:
+            best_score = cv_results[f"test-{param_space['eval_metric']}-mean"].max()
+            best_iter = cv_results[f"test-{param_space['eval_metric']}-mean"].idxmax() + 1
+
+        return best_score, best_iter
+    # -------------------------------------------
+    def __lgbm_cv(self, param_space, train_set, early_stopping_rounds, nfold, shuffle, seed, direction):
+        if param_space['objective'] in self.__classification_loss:
+            stratified = True
+        else:
+            stratified = False
+
+        # Разные варики итераций
+        if 'n_estimators' in param_space:
+            num_boost_round = param_space['n_estimators']
+        elif 'iterations' in param_space:
+            num_boost_round = param_space['iterations']
+        else:
+            num_boost_round = 1_000
+            
+        cv_results = lgbm.cv(
+            params = param_space,
+            train_set = train_set,
+            nfold = nfold,
+            shuffle = shuffle,
+            stratified = stratified,
+            seed = seed,
+            num_boost_round = num_boost_round,
+            callbacks=[lgbm.early_stopping(stopping_rounds=early_stopping_rounds, verbose=False)],
+        )
+        
+        if direction == 'minimize':
+            best_score = np.min(cv_results[f"valid {param_space['metric']}-mean"])
+        else:
+            best_score = np.max(cv_results[f"valid {param_space['metric']}-mean"])
+            
+        best_iter = cv_results[f"valid {param_space['metric']}-mean"].index(best_score)
+        return best_score, best_iter
+    # -------------------------------------------  
+    def search(self, X, y, catboost_kwargs=None, xgb_kwargs=None, lgbm_kwargs=None):
+        catboost_kwargs = catboost_kwargs or {}
+        xgb_kwargs = xgb_kwargs or {}
+        lgbm_kwargs = lgbm_kwargs or {}
+        
+        self.best_params_ = {}
+        self.best_scores_ = {}
+        for model, params in self.param_space.items():
+            #  define direction
+            if 'eval_metric' in params:
+                if params['eval_metric'].lower() in self.__minimize_metrics:
+                    direction = 'minimize'
+                elif params['eval_metric'].lower() in self.__maximize_metrics:
+                    direction = 'maximize'
+                else:
+                    raise ValueError('Wrong metric for eval')
+            elif 'metric' in params:
+                if params['metric'].lower() in self.__minimize_metrics:
+                    direction = 'minimize'
+                elif params['metric'].lower() in self.__maximize_metrics:
+                    direction = 'maximize'
+                else:
+                    raise ValueError('Wrong metric for eval')
+                
+            def objective(trial):
+                # param sampling
+                param_space = {}
+                for param_name, param_dist in params.items():
+                    if param_dist.__class__.__module__ == 'optuna.distributions':
+                        param_space[param_name] = trial._suggest(param_name, param_dist)
+                    else:
+                        param_space[param_name] = trial.suggest_categorical(param_name, [param_dist])
+                
+  
+                # Если кросс-валидация        
+                if self.cv:
+                    if 'catboost' in model().__class__.__module__:
+                        pool = cb.Pool(X, y, **catboost_kwargs)
+                        best_score, best_iter = self.__catboost_cv(param_space, pool, 
+                                                                   self.early_stopping_rounds, self.nfold, self.shuffle, self.random_state,
+                                                                   direction=direction) 
+                        trial.set_user_attr('best_iter', best_iter)
+                        return best_score
+                    elif 'xgboost' in model().__class__.__module__:
+                        dtrain = xgb.DMatrix(X, y, **xgb_kwargs)
+                        best_score, best_iter = self.__xgboost_cv(param_space, dtrain, 
+                                                                  self.early_stopping_rounds, self.nfold, self.shuffle, self.random_state, 
+                                                                  direction)
+                        trial.set_user_attr('best_iter', best_iter)
+                        return best_score
+                    elif 'lightgbm' in model().__class__.__module__:
+                        train_set = lgbm.Dataset(X, y, **lgbm_kwargs)
+                        best_score, best_iter = self.__lgbm_cv(param_space, train_set, 
+                                                               self.early_stopping_rounds, self.nfold, self.shuffle, self.random_state, 
+                                                               direction)
+                        trial.set_user_attr('best_iter', best_iter)
+                        return best_score
+                    else:
+                        pass
+                # если eval_set
+                else:
+                    if 'catboost' in model().__class__.__module__:
+                        pass
+                    elif 'xgboost' in model().__class__.__module__:
+                        pass
+                    elif 'lightgbm' in model().__class__.__module__:
+                        pass
+                    else:
+                        pass
+            # --------- Сам поиск -----------------------------
+            optuna.logging.set_verbosity(optuna.logging.WARNING)
+            @self.__tqdm_study(n_trials=self.n_trials, model=model(), direction=direction)
+            def run_optuna(tqdm_callback=None):
+                study = optuna.create_study(direction=direction,
+                                             sampler=self.sampler)
+                study.optimize(func=objective, n_trials=self.n_trials, callbacks=[tqdm_callback])
+                return study
+                
+            study = run_optuna()
+ 
+            best_params = study.best_params
+            if 'catboost' in model().__class__.__module__:
+                best_params['iterations'] = study.best_trial.user_attrs['best_iter']
+            elif 'xgboost' in model().__class__.__module__ or 'lightgbm' in model().__class__.__module__:
+                best_params['n_estimators'] = study.best_trial.user_attrs['best_iter']
+                
+            self.best_params_[model] = best_params
+            self.best_scores_[model] = study.best_value
