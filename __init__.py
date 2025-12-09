@@ -1,1 +1,1 @@
-__all__ = ['suchen', 'klasse', 'prep']
+__all__ = ['klasse', 'prep']

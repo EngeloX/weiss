@@ -1,3 +1,3 @@
-from ._feature_engineering import Grouper
+from ._feature_engineering import Grouper, PCACreator, NMFCreator
 
-__all__ = ['Grouper']
+__all__ = ['Grouper', 'NMFCreator', 'PCACreator']

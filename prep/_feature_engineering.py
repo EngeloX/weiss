@@ -139,3 +139,123 @@ class Grouper(BaseEstimator, TransformerMixin):
             return out
         else:
             return out[self.new_cols_]
+
+# ==================================================================================================================================================================
+
+from sklearn.decomposition import PCA
+from sklearn.preprocessing import StandardScaler
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+class PCACreator(BaseEstimator, TransformerMixin):
+    def __init__(self, n_components=None, num_features=None, optimum=0.9, return_df=False):
+        self.n_components = n_components
+        self.num_features = num_features
+        self.optimum = optimum
+        self.return_df = return_df
+        
+    def fit(self, X, y=None):
+        X_standarded = X.copy()
+        
+        if self.num_features is None:
+            self.num_features = X.select_dtypes(include='number').columns.to_list()
+        
+        self.scaler = StandardScaler()
+        self.scaler.fit(X_standarded[self.num_features])
+        X_standarded[self.num_features] = self.scaler.transform(X_standarded[self.num_features])
+        
+        self.pca = PCA(n_components=self.n_components)
+        self.pca.fit(X_standarded[self.num_features])
+        
+        self.explained_variance_ratio_ = self.pca.explained_variance_ratio_
+        
+        if self.n_components is None:
+            self.cumsum = np.cumsum(self.explained_variance_ratio_)
+            
+            self.n_components = np.argmax(self.cumsum >= self.optimum) + 1
+            self.opt_variance = np.min(self.cumsum[self.n_components - 1])
+            # переучиваем под лучшее число компонент
+            self.pca = PCA(n_components=self.n_components)
+            self.pca.fit(X_standarded[self.num_features])
+            self.explained_variance_ratio_ = pca.explained_variance_ratio_
+            
+            
+        return self
+            
+
+    def transform(self, X):
+        X_standarded = X.copy()
+        
+        X_standarded[self.num_features] = self.scaler.transform(X[self.num_features])
+        
+        new_features = self.pca.transform(X_standarded[self.num_features])
+
+        if self.return_df:
+            columns = []
+            for i in range(new_features.shape[1]):
+                columns.append(f"PCA_{i}")
+            df = pd.DataFrame(new_features, columns=columns)
+            return df
+        else:
+            return new_features
+        
+    def plot_optimal(self):
+        sns.set_theme(style="darkgrid")
+        data = pd.DataFrame({'n_components': range(1, len(self.cumsum) + 1), 
+                             'cumsum': self.cumsum.round(4)})
+        sns.lineplot(data=data, x='n_components', y='cumsum', c='black')
+        sns.scatterplot(data, x='n_components', y='cumsum', markers='o', c='black', s=50, alpha=1)
+        plt.axvline(self.n_components, c='black', linestyle='--', alpha=0.3)
+        plt.axhline(self.opt_variance, c='black', linestyle='--', alpha=0.3)
+        plt.scatter(x=self.n_components, y=self.opt_variance, c='r', s=60, alpha=1)
+        
+        plt.xlabel("n_components")
+        plt.ylabel("cumsum explained variance")
+        plt.title("PCA - optimal n_components")
+
+        plt.xticks(range(1, len(self.cumsum) + 1))
+        
+        plt.show()
+        
+# ==========================================================================================================================================================================
+
+from sklearn.decomposition import NMF
+from sklearn.preprocessing import MinMaxScaler
+
+class NMFCreator(BaseEstimator, TransformerMixin):
+    def __init__(self, n_components=None, num_features=None, return_df=False, max_iter=1000):
+        self.n_components = n_components
+        self.num_features = num_features
+        self.return_df = return_df
+        self.max_iter = max_iter
+        
+    def fit(self, X, y=None):
+        X_minmaxed = X.copy()
+        
+        if self.num_features is None:
+            self.num_features = X.select_dtypes(include='number').columns.to_list()
+        
+        self.scaler = MinMaxScaler()
+        self.scaler.fit(X_minmaxed[self.num_features])
+        X_minmaxed[self.num_features] = self.scaler.transform(X_minmaxed[self.num_features])
+        
+        self.nmf = NMF(n_components=self.n_components, max_iter=self.max_iter)
+        self.nmf.fit(X_minmaxed[self.num_features])
+        
+        return self
+        
+    def transform(self, X):
+        X_minmaxed = X.copy()
+        
+        X_minmaxed[self.num_features] = self.scaler.transform(X[self.num_features])
+        
+        new_features = self.nmf.transform(X_minmaxed[self.num_features])
+
+        if self.return_df:
+            columns = []
+            for i in range(new_features.shape[1]):
+                columns.append(f"PCA_{i}")
+            df = pd.DataFrame(new_features, columns=columns)
+            return df
+        else:
+            return new_features
